@@ -1,0 +1,404 @@
+---
+title: "Cognitive Neuroscience | Exam F24"
+author: "Naja Mølle Lindelof"
+date: "2024"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+
+# Setup coding environment
+
+Using package versions:
+- Base R 4.3.2
+- pacman 0.5.1
+- tidyverse 2.0.0
+- conflicted 1.2.0
+- cmdstanr 0.8.0
+- dagitty 0.3.4
+- rethinking 2.4
+
+
+
+```{r load_rethinking}
+
+# Install rethinking dependencies
+install.packages(c("coda","mvtnorm","devtools","loo","dagitty","shape"))
+install.packages("cmdstanr", repos = c("https://mc-stan.org/r-packages/", getOption("repos")))
+library(cmdstanr)
+install_cmdstan()
+
+# Install rethinking package
+devtools::install_github("rmcelreath/rethinking")
+library(rethinking)
+
+
+# Install additional packages
+install.packages("pacman")
+pacman::p_load(tidyverse, dagitty, conflicted)
+
+```
+
+Might check out Bayesian modelling in Python(: https://juanitorduz.github.io/intro_pymc3/ 
+
+
+```{r load_data}
+
+# Load full events file
+data <- read_csv("all_models_events.csv")
+
+```
+
+
+```{r merge_events}
+
+# Load and merge event files from all subjects, all runs
+data <- list.files(pattern = '.csv') %>% 
+  lapply(read_csv) %>% 
+  bind_rows %>% 
+  select(-ses, -month, -day, -hour, -minute)
+
+# Save merged data 
+write.csv(data, "all_models_events.csv", row.names = FALSE)
+
+```
+
+## Preprocessing
+
+Goal of preprocessing = to differentiate btw trial type (emotional valence of word) and discrimination task (positive or negative image). In unpreprocessed data, these five categories are in one column - they must be in two for running the analysis.
+
+Note that a "b" response indicate positive discrimination, and "y" response a negative.
+
+Preprocessing inspired from: https://github.com/sabszh/CogNeuroExam/blob/main/preprocessing%26analysis.Rmd 
+
+
+```{r do_preprocessing}
+
+# Get information per trial, i.e. per word for each subject's trials
+prep_data <- data %>%
+  
+  ## Pivot the data to make trial_type values into columns
+  pivot_wider(names_from = trial_type,      
+              # Select the values to populate the new columns
+              values_from = c(onset, duration, trial_type),    
+              names_glue = "{.value}_{trial_type}") %>% 
+
+    ## Build separate columns declaring image and word types per trial
+  # One column for type of image
+  unite("image_type", c("trial_type_image_neg", "trial_type_image_pos"), 
+        sep = "_", remove = T, na.rm = T) %>%
+  
+  # One column for word valence
+  unite("word_type", c("trial_type_word_neg", "trial_type_word_neu", "trial_type_word_pos"), 
+        sep = "_", remove = T, na.rm = T) %>% 
+  
+
+  ## Clean and unite columns for images and words for onset and duration
+  # Make one column for onset_image
+  unite("onset_image", 
+        c("onset_image_neg", "onset_image_pos"), sep = "", 
+        # Remove input columns and NA values from opposite column
+        remove = T, na.rm = T) %>%
+  # One column for onset_word
+  unite("onset_word", 
+        c("onset_word_neg", "onset_word_neu", "onset_word_pos"), sep = "_",
+        remove = T, na.rm = T) %>%
+  
+  # One column for duration of word and image respectively
+  unite("duration_image", c("duration_image_neg", "duration_image_pos"), sep = "_", remove = T, na.rm = T) %>%
+  
+  unite("duration_word", c("duration_word_neg", "duration_word_neu", "duration_word_pos"), sep = "_", remove = T, na.rm = T)
+
+```
+
+```{r inspect_values}
+
+## Check for missing values
+prep_data <- prep_data %>% 
+  # Remove NA and/or negative RT values
+  dplyr::filter(!is.na(response_time) | !response_time < 0)
+
+# Check if any subject reversed response (y = negative discrimination) and was categorised as correct
+prep_data %>% 
+  dplyr::filter(image_type == "image_pos" & word_type == "word_pos" & response == "y" & correct_resp == 1)
+
+prep_data %>% 
+  dplyr::filter(image_type == "image_neg" & word_type == "word_neg" & response == "b" & correct_resp == 1)
+
+```
+
+
+
+```{r index_variables}
+
+# Make word conditions into index variable
+prep_data$word_cat <- coerce_index(prep_data$word_type)
+check_index(prep_data$word_cat)
+
+# Make subject index into index form 1:15
+prep_data$sub_index <- coerce_index(as.factor(prep_data$sub))
+check_index(prep_data$sub_index)
+
+prep_data %>% 
+  dplyr::filter(!is.na(word_cat))
+
+```
+
+## Analysis
+
+### DAG
+
+Described in experiment description:
+Valence of word as proxy for local context predictability, i.e. knowing word valence makes lcp 
+
+
+```{r build_dag}
+
+set.seed(2024)
+
+awesome_dag <- dagitty("dag{
+  Local_context_predictability -> Word_valence
+  Word_valence -> Emoji_expression
+  Emoji_expression -> RT
+  
+}")
+
+drawdag(awesome_dag)
+
+# implied independencies
+impliedConditionalIndependencies(awesome_dag)
+
+# Compuet adjustment set
+adjustmentSets(awesome_dag, exposure = "Word_valence", outcome = "RT")
+
+```
+
+
+
+Simulation of dag and implied codnitional independencies left out due to scope of the project.
+
+
+### Analysis
+
+
+
+
+Varying effects models are useful for modeling time series, as well as spatial clustering. In a time series, the observations cluster by entities that have continuity through time, such as individuals.
+Since observations within individuals are likely highly correlated, the multilevel structure can help quite a lot
+
+model RT using Context clustered Subject
+
+
+participant = cluster variable --> multiple observations made within each cluster
+- If we ignore the clusters, assigning the same intercept to each of them, then we risk ignoring important variation in baseline survival --> risk masking association with other variables.
+
+I.e. we want __A multilevel model__ --> simultaneously estimate both an intercept for each tank and the variation among tanks, i.e. varying intercepts model --> the simplest kind of varying effects.
+-  adaptively pools information across participants
+- For each cluster in the data, we use a unique intercept parameter: adaptively learn the prior that is common to all of these intercepts --> what we learn about each cluster informs all the other clusters, we learn the prior simultaneous to learning the intercept
+
+
+"assuming conventional Gaussian hyperparameters (mcelreath pp. 417)"
+"use weakly regularizing exponential hyperpriors for the variance σ parameters that estimate the variation across clusters in the data" pp.421
+
+
+RT ∼ SOME_FUNCTION(parameter, parameter2)
+parameter = αsubject[i]
+αj ∼ Normal(α¯, σ) [adaptive prior]
+α¯ ∼ Normal(actual numerical mean, numerical sd) [prior for average sub]
+σ ∼ Exponential(1) [prior for standard deviation of tanks]
+
+
+
+NOT DOING MORE COMPLEX MULTILEVEL MODELLING --> INSTEAD POINT TO THAT AS A PLACE TO IMPROVE, I.E. MODELLING MORE INFORMATION, E.G. BLOCKS, STIMULI AS RANDOM EFFECTS ETC
+
+"But when using robust regression, we don’t usually try to estimate ν, because there aren’t enough extreme observations to do so. Instead we assume ν is small (thick tails) in order to reduce the influence of outliers"
+- 3 df - free to vary as number of categories???
+
+
+```{r}
+
+set.seed(2024)
+
+# Make slim data list, standardise RT
+dat <- with(prep_data, list(
+  RT = standardize(response_time),
+  Valence = word_cat,
+  Subject = sub_index
+  #stimulus = word
+))
+
+
+model <- ulam(
+  alist(
+    RT ~ dstudent(3, mu, sigma),
+    mu <- a[Valence] + a_sub[Subject],
+    
+    # Adaptive hyperparameter priors
+    a[Valence] ~ dnorm(a_bar, sigma_v),
+    a_sub[Subject] ~ dnorm(asub_bar, sigma_sub),
+    
+    
+    # Hyperpriors
+    a_bar ~ dnorm(0, .5), # Centered on 0 seconds (standardised), sd of +-  s
+    asub_bar ~ dnorm(0, .5),  
+    
+    sigma ~ dexp(1),
+    sigma_v ~ dexp(1),
+    sigma_sub ~ dexp(1)
+    
+    ), 
+  data = dat, chains = 4, log_lik = T)
+
+
+```
+
+
+```{r}
+
+# Inspect MCMC chains
+trankplot(model, n_cols = 2)
+traceplot_ulam(model, chains = 1)
+
+```
+
+
+```{r ppc}
+
+set.seed(222)
+prior <- extract.prior(model, n = 1e4)
+
+# show first 100 populations in the posterior
+plot( NULL , xlim=c(-3,3) , ylim=c(0,3), main = "prior predictive check",
+xlab="standardised RT (sec)" , ylab="Density" )
+for ( i in 1:50 )
+curve( dnorm(x,prior$a_bar[i],prior$sigma[i]) , add=TRUE ,
+col=col.alpha("black",0.2) )
+
+```
+
+
+
+```{r precis}
+
+# Check model output
+precis(model, depth = 2)
+
+```
+```{r}
+
+plot(precis(model, depth = 2))
+
+```
+
+
+
+
+```{r}
+
+set.seed(2024)
+# Simulate posterior predictions and plot over the observed outcomes used in fitting.
+## The vertical axis = predicted RT for each case on the horizontal. 
+## The blue points = the empirical RT for each row of the data. 
+## The open circles = the posterior mean ¯p, with 89% PI percentile interval, and the + symbols mark the 89% interval of predicted RT
+postcheck(model)
+
+```
+
+
+
+```{r}
+
+mu <- link(model)
+mu.mean <- apply( mu , 2 , mean )
+mu.PI <- apply( mu , 2 , PI , prob=0.89 )
+sim.rt <- sim(model)
+rt.PI <- apply(sim.rt, 2, PI, prob=0.89)
+
+# Plot the observed data
+plot(dat$RT ~ dat$Valence, col=col.alpha(rangi2, 0.5), 
+     xlab="Valence", ylab="Standardized Reaction Time")
+
+# Add the mean of the posterior predictive distributions
+lines(unique(dat$Valence), mu.mean, col="blue")
+
+# Add the 89% credible interval for the posterior predictive means
+shade(mu.PI, unique(dat$Valence), col=col.alpha("blue", 0.2))
+
+# Add the 89% prediction interval for the simulated data
+shade(rt.PI, unique(dat$Valence), col=col.alpha("blue", 0.1))
+
+```
+
+
+
+
+
+
+## Attempt at varying slope model
+
+
+```{r}
+
+model_2 <- ulam(
+  alist(
+    RT ~ dstudent(3, mu, sigma),
+    #mu <- a[Valence] + a_sub[Subject],
+    mu <- a[Subject] + b[Subject]*Valence,
+    
+    # Adaptive correlation matrix hyperparameter
+    c(a, b)[Subject] ~ multi_normal(c(a_bar, b_bar), Rho, sigma_sub),
+    
+    # Hyperpriors
+    a_bar ~ normal(0, .5), # Centered on 0 seconds (standardised), sd of +- 1 s
+    b_bar ~ normal(0, .2), # average slop is average change in RT for one change in 
+    Rho ~ lkj_corr(2),
+    
+    sigma ~ dexp(1),
+    #sigma_v ~ dexp(1),
+    sigma_sub ~ dexp(1)
+    
+    ), 
+  data = dat, chains = 4, log_lik = T)
+
+```
+
+```{r}
+
+# Inspect MCMC chains
+traceplot_ulam(model, chains = 1)
+trankplot(model, n_cols = 2)
+
+```
+
+
+```{r}
+
+precis(model_2, depth = 2)
+
+plot(precis(model_2, depth = 2))
+
+```
+
+
+
+
+```{r}
+
+post <- extract.samples(model_2)
+dens( post$Rho[,1,2] , xlim=c(-1,1) ) # posterior
+R <- rlkjcorr( 1e4 , K=2 , eta=2 ) # prior
+dens( R[,1,2] , add=TRUE , lty=2 )
+
+```
+
+
+
+
+```{r}
+
+compare(model, model_2, func = PSIS)
+plot(compare(model, model_2, func = PSIS))
+
+
+```
